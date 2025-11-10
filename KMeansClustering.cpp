@@ -258,19 +258,7 @@ private:
             points_in_cluster[cluster_id]++;
         }
 
-        // Calculate the new mean (centroid) for each cluster
-        for (int i = 0; i < num_clusters; ++i)
-        {
-            // Avoid division by zero for empty clusters
-            if (points_in_cluster[i] > 0)
-            {
-                clusters[i].centroid.x = new_centroids[i].x / points_in_cluster[i];
-                clusters[i].centroid.y = new_centroids[i].y / points_in_cluster[i];
-            }
-            // Note: Handling empty clusters is a design choice. A more advanced
-            // implementation might re-initialize the centroid of an empty cluster.
-            // Here, we simply let it remain in its last known position.
-        }
+        calculate_new_mean(new_centroids, points_in_cluster);
     }
 
     void update_centroids_with_parallelisation(const std::vector<Point> &points, const std::vector<int> &assignments)
@@ -303,6 +291,11 @@ private:
             }
         }
 
+        calculate_new_mean(new_centroids, points_in_cluster);
+        
+    }
+
+    void calculate_new_mean(std::vector<Point> new_centroids, std::vector<int> points_in_cluster){
         // Calculate the new mean (centroid) for each cluster
         for (int i = 0; i < num_clusters; ++i)
         {
@@ -332,9 +325,6 @@ private:
         }
     }
 };
-
-// Include your KMeans implementation here
-// (You can just paste your full KMeans code above this main function)
 
 int main()
 {
