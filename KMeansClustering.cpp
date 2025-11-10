@@ -3,6 +3,9 @@
 #include <limits>    // For std::numeric_limits
 #include <random>    // For modern C++ random number generation
 #include <algorithm> // For std::shuffle
+#include <chrono>
+#include <iostream>
+#include <omp.h>
 
 /**
  * @struct Point
@@ -110,6 +113,51 @@ public:
         return clusters;
     }
 
+    std::vector<Cluster> run_with_parallelization(const std::vector<Point>& points) {
+        // Cannot have more clusters than points.
+        if (points.size() < num_clusters) {
+            // In a real-world scenario, you might throw an exception.
+            // For this example, we return an empty result.
+            return {};
+        }
+
+        // 1. Initialization: Randomly select K points as initial centroids.
+        initialize_centroids(points);
+
+        // This vector will store the cluster ID for each point.
+        std::vector<int> point_assignments(points.size(), -1);
+
+        // Main K-Means loop
+        for (int iter = 0; iter < max_iterations; ++iter) {
+            bool assignments_changed = false;
+
+            // 2. Assignment Step: Assign each point to the nearest centroid.
+            #pragma omp parallel for
+            for (size_t i = 0; i < points.size(); ++i) {
+                int nearest_cluster_id = get_nearest_cluster_id(points[i]);
+                
+                // If the point's cluster assignment has changed, note it.
+                if (point_assignments[i] != nearest_cluster_id) {
+                    point_assignments[i] = nearest_cluster_id;
+                    #pragma omp atomic write
+                    assignments_changed = true;
+                }
+            }
+
+            // 3. Update Step: Recalculate centroids based on new assignments.
+            update_centroids_with_parallelisation(points, point_assignments);
+
+            // 4. Convergence Check: If no assignments changed, the algorithm has converged.
+            if (!assignments_changed) {
+                break;
+            }
+        }
+
+        // Final population of cluster points for the return value
+        populate_final_clusters(points, point_assignments);
+        return clusters;
+    }
+
 private:
     int num_clusters; // K
     int max_iterations;
@@ -124,8 +172,9 @@ private:
         std::vector<Point> shuffled_points = points;
 
         // Use a modern C++ random number generator for shuffling
-        std::random_device rd;
-        std::mt19937 g(rd());
+        //std::random_device rd;
+        //std::mt19937 g(rd());
+         std::mt19937 g(1234);
         std::shuffle(shuffled_points.begin(), shuffled_points.end(), g);
 
         // Select the first K unique points as initial centroids
@@ -197,6 +246,45 @@ private:
         }
     }
 
+    void update_centroids_with_parallelisation(const std::vector<Point>& points, const std::vector<int>& assignments) {
+        // Create vectors to accumulate sums and count points for each cluster
+        std::vector<Point> new_centroids(num_clusters, {0.0, 0.0});
+        std::vector<int> points_in_cluster(num_clusters, 0);
+
+        #pragma omp parallel
+        {
+            std::vector<Point> new_centroids_local(num_clusters, {0.0, 0.0});
+            std::vector<int> points_in_cluster_local(num_clusters, 0);
+
+            #pragma omp for
+            for (size_t i = 0; i < points.size(); ++i)
+            {
+                int cluster_id = assignments[i];
+                new_centroids_local[cluster_id].x += points[i].x;
+                new_centroids_local[cluster_id].y += points[i].y;
+                points_in_cluster_local[cluster_id]++;
+            }
+            #pragma omp critical
+            {
+                for (int i = 0; i < num_clusters; i++)
+                {
+                    new_centroids[i].x += new_centroids_local[i].x;
+                    new_centroids[i].y += new_centroids_local[i].y;
+                    points_in_cluster[i] += points_in_cluster_local[i];
+                }
+            }
+        }
+
+        // Calculate the new mean (centroid) for each cluster
+        for (int i = 0; i < num_clusters; ++i) {
+            // Avoid division by zero for empty clusters
+            if (points_in_cluster[i] > 0) {
+                clusters[i].centroid.x = new_centroids[i].x / points_in_cluster[i];
+                clusters[i].centroid.y = new_centroids[i].y / points_in_cluster[i];
+            }
+        }
+    }
+
     /**
      * @brief Populates the `points` vector of each cluster based on the final assignments.
      * @param points The full dataset of points.
@@ -211,3 +299,50 @@ private:
         }
     }
 };
+
+
+// Include your KMeans implementation here
+// (You can just paste your full KMeans code above this main function)
+
+int main() {
+    // Parameters
+    const int num_points = 1000000;   // number of data points
+    const int num_clusters = 10;     // number of clusters (K)
+
+    // Generate random 2D points
+    std::vector<Point> points;
+    points.reserve(num_points);
+
+    std::mt19937 gen(1234); 
+    std::uniform_real_distribution<double> dist(-100.0, 100.0);
+
+    for (int i = 0; i < num_points; ++i) {
+        points.push_back({dist(gen), dist(gen)});
+    }
+
+    // Create KMeans object
+    KMeans kmeans(num_clusters);
+
+    // Measure execution time
+    auto start = std::chrono::high_resolution_clock::now();
+    //std::vector<Cluster> clusters = kmeans.run(points);
+    std::vector<Cluster> clusters = kmeans.run_with_parallelization(points);
+    auto end = std::chrono::high_resolution_clock::now();
+
+    // Calculate duration
+    std::chrono::duration<double> duration = end - start;
+
+    // Output results
+    std::cout << "K-Means finished in " << duration.count() << " seconds.\n";
+    std::cout << "Final cluster centroids:\n";
+
+    for (const auto& cluster : clusters) {
+        std::cout << "Cluster " << cluster.id << ": ("
+                  << cluster.centroid.x << ", "
+                  << cluster.centroid.y << ")"
+                  << " -> " << cluster.points.size() << " points\n";
+    }
+
+    return 0;
+}
+
