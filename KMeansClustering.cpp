@@ -6,6 +6,7 @@
 #include <chrono>
 #include <iostream>
 #include <omp.h>
+#include <fstream>
 
 /**
  * @struct Point
@@ -326,11 +327,36 @@ private:
     }
 };
 
+
+void save_clusters_to_csv(const std::vector<Cluster> &clusters, const std::string &filename)
+{
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not write file " << filename << "\n";
+        return;
+    }
+
+    // CSV header (optional)
+    file << "x,y,cluster,type\n";
+
+    for (const auto &cluster : clusters)
+    {
+        for (const auto &p : cluster.points)
+        {
+            file << p.x << "," << p.y << "," << cluster.id << ",0\n";
+        }
+
+        file << cluster.centroid.x << "," << cluster.centroid.y << "," << cluster.id << ",1\n";
+    }
+
+    file.close();
+}
+
 int main()
 {
     // Parameters
-    const int num_points = 1000000; // number of data points
-    const int num_clusters = 5;    // number of clusters (K)
+    const int num_points = 1000; // number of data points
+    const int num_clusters = 7;    // number of clusters (K)
 
     // Generate random 2D points
     std::vector<Point> points;
@@ -372,6 +398,9 @@ int main()
                   << cluster.centroid.y << ")"
                   << " -> " << cluster.points.size() << " points\n";
     }
+
+    save_clusters_to_csv(clusters, "clusters.csv");
+    std::cout << "Saved clustered points to clusters.csv\n";
 
     return 0;
 }
