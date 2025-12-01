@@ -1,3 +1,4 @@
+#pragma GCC target("avx")
 #include <vector>
 #include <cmath>
 #include <limits>
@@ -8,6 +9,7 @@
 #include <omp.h>
 #include <fstream>
 #include <immintrin.h> // OBAVEZNO: Biblioteka za AVX intrinzične funkcije
+
 
 struct Point
 {
@@ -108,8 +110,6 @@ private:
     // --- OVO JE KLJUČNA FUNKCIJA KOJU JE ASISTENT TRAŽIO ---
     void update_centroids_avx(const std::vector<Point> &points, const std::vector<int> &assignments)
     {
-        // Broj parova klastera (jer u jedan AVX registar staju 2 klastera: c0c1, c2c3...)
-        // (num_clusters + 1) / 2 osigurava da pokrijemo i neparan broj klastera
         int num_avx_clusters = (num_clusters + 1) / 2;
 
         std::vector<Point> global_sums(num_clusters, {0.0, 0.0});
@@ -117,104 +117,77 @@ private:
 
         #pragma omp parallel
         {
-            // Lokalni akumulatori: Svaki __m256d drži sume za DVA klastera.
-            // Format registra: [ClusterA_X, ClusterA_Y, ClusterB_X, ClusterB_Y]
-            // Ovo je ono što je asistent mislio sa "Vektor od n! npr c0c1"
-            std::vector<__m256d> local_sums_avx(num_avx_clusters, _mm256_setzero_pd());
-            std::vector<int> local_counts(num_clusters, 0);
+            // 1. ALOKACIJA: Koristimo _mm_malloc umjesto std::vector da osiguramo 32-byte alignment
+            __m256d* local_sums_avx = (__m256d*)_mm_malloc(num_avx_clusters * sizeof(__m256d), 32);
+            
+            // Inicijalizacija na nulu (obavezno jer malloc ne briše smeće)
+            for(int k = 0; k < num_avx_clusters; k++) {
+                local_sums_avx[k] = _mm256_setzero_pd();
+            }
 
-            // Cast u double pointer da možemo učitavati direktno u AVX
+            std::vector<int> local_counts(num_clusters, 0);
             const double* raw_points = reinterpret_cast<const double*>(points.data());
             size_t n = points.size();
 
-            // Procesiramo 2 tačke odjednom (stride = 2)
             #pragma omp for
             for (size_t i = 0; i < n / 2 * 2; i += 2)
             {
-                // 1. "Vektorizaciju struct point 2 sa 4 mmx double"
-                // Učitamo tačku 'i' i tačku 'i+1' u jedan registar.
-                // p_vec sadrži: [Px1, Py1, Px2, Py2]
                 __m256d p_vec = _mm256_loadu_pd(&raw_points[i * 2]);
+                __m128d p1_128 = _mm256_extractf128_pd(p_vec, 0);
+                __m128d p2_128 = _mm256_extractf128_pd(p_vec, 1);
 
-                // Razbijemo vektor na dvije tačke (za procesiranje assignmenta)
-                // P1 koristi donjih 128 bita, P2 gornjih 128 bita
-                __m128d p1_128 = _mm256_extractf128_pd(p_vec, 0); // [Px1, Py1]
-                __m128d p2_128 = _mm256_extractf128_pd(p_vec, 1); // [Px2, Py2]
-
-                // Dohvatimo ID-eve klastera
                 int id1 = assignments[i];
                 int id2 = assignments[i+1];
 
-                // Update counts
                 local_counts[id1]++;
                 local_counts[id2]++;
 
-                // 2. Dodavanje na "potencijal klastera" (SABIRANJE U c0c1)
-                
-                // Za tačku 1:
-                int vec_idx1 = id1 / 2; // Koji AVX registar (par klastera)
-                bool is_odd1 = id1 % 2; // Da li je gornji (c1) ili donji (c0) dio
-
-                // Kreiramo vektor koji ima [Px1, Py1] na pravom mjestu, a nule drugdje
-                // Ako je id1 paran: [Px1, Py1, 0, 0]
-                // Ako je id1 neparan: [0, 0, Px1, Py1]
-                __m256d val1 = _mm256_castpd128_pd256(p1_128); // Stavi u donji dio
+                // Tačka 1
+                int vec_idx1 = id1 / 2;
+                bool is_odd1 = id1 % 2;
+                __m256d val1;
                 if (is_odd1) {
-                    // Prebaci u gornji dio: [0, 0, Px1, Py1]
-                    val1 = _mm256_permute2f128_pd(val1, val1, 0x08); // 0x08 kodira shift u gornji lane
-                    // Napomena: Za jednostavnost i brzinu kompajliranja, može se koristiti i _mm256_set_m128d
-                     val1 = _mm256_set_m128d(p1_128, _mm_setzero_pd()); // Gornji, Donji (obrnuto u set funkciji)
+                     val1 = _mm256_set_m128d(p1_128, _mm_setzero_pd());
                 } else {
                      val1 = _mm256_set_m128d(_mm_setzero_pd(), p1_128);
                 }
-                
-                // Saberi sa akumulatorom cXcY
                 local_sums_avx[vec_idx1] = _mm256_add_pd(local_sums_avx[vec_idx1], val1);
 
-
-                // Za tačku 2 (isto):
+                // Tačka 2
                 int vec_idx2 = id2 / 2;
                 bool is_odd2 = id2 % 2;
-                
                 __m256d val2;
                 if (is_odd2) {
                      val2 = _mm256_set_m128d(p2_128, _mm_setzero_pd());
                 } else {
                      val2 = _mm256_set_m128d(_mm_setzero_pd(), p2_128);
                 }
-                
                 local_sums_avx[vec_idx2] = _mm256_add_pd(local_sums_avx[vec_idx2], val2);
             }
 
-            // Obrada preostalih tačaka (ako je broj tačaka neparan)
+            // Ostatak (neparan broj tačaka)
             if (n % 2 != 0) {
-                size_t i = n - 1;
-                int id = assignments[i];
-                local_counts[id]++;
-                int vec_idx = id / 2;
-                bool is_odd = id % 2;
-                
-                __m128d p_single = _mm_loadu_pd(&raw_points[i * 2]);
-                __m256d val;
-                 if (is_odd) {
-                     val = _mm256_set_m128d(p_single, _mm_setzero_pd());
-                } else {
-                     val = _mm256_set_m128d(_mm_setzero_pd(), p_single);
+                #pragma omp single 
+                {
+                   // Ovaj dio mora biti single ili handled carefully u paralelizaciji ako loop ne pokriva sve
+                   // Ali pošto je 'omp for' gore, onaj thread koji dobije zadnji chunk će ovo odraditi
+                   // Mada, najsigurnije je ostatak obraditi van omp for-a, ali unutar parallel regiona samo ako je thread zadužen za taj index.
+                   // Zbog jednostavnosti HPC zadatka, pretpostavimo da 'omp for' hendla iteracije, 
+                   // ali moramo ručno hendlati zadnji element ako ga loop preskoči.
+                   // NAJSIGURNIJE: Obraditi zadnju tačku sekvencijalno VAN parallel regiona ili unutar 'single'.
+                   // Ovdje ćemo samo preskočiti za demo da ne komplikujemo logiku niti,
+                   // jer AVX obično traži padding podataka.
                 }
-                local_sums_avx[vec_idx] = _mm256_add_pd(local_sums_avx[vec_idx], val);
+                // Za potrebe zadatka paralelizacije: ignorisat ćemo 1 tačku ako je neparan broj
+                // ili se to rješava paddingom niza points na paran broj prije poziva funkcije.
             }
 
-            // 3. "Na kraju razbijes sve" - Redukcija iz AVX registara u običnu memoriju
             #pragma omp critical
             {
                 for (int j = 0; j < num_avx_clusters; ++j) {
-                    // Izvucemo vrijednosti iz AVX registra
-                    // [SumX_ClusterA, SumY_ClusterA, SumX_ClusterB, SumY_ClusterB]
-                    //alignas(32) double temp[4];
                     double temp[4];
                     _mm256_storeu_pd(temp, local_sums_avx[j]);
 
-                    // Klaster A (paran indeks: 2*j)
                     int c_id_A = j * 2;
                     if (c_id_A < num_clusters) {
                         global_sums[c_id_A].x += temp[0];
@@ -222,7 +195,6 @@ private:
                         global_counts[c_id_A] += local_counts[c_id_A];
                     }
 
-                    // Klaster B (neparan indeks: 2*j + 1)
                     int c_id_B = j * 2 + 1;
                     if (c_id_B < num_clusters) {
                         global_sums[c_id_B].x += temp[2];
@@ -231,13 +203,23 @@ private:
                     }
                 }
             }
+
+            // 2. ČIŠĆENJE: Obavezno osloboditi memoriju!
+            _mm_free(local_sums_avx);
         }
 
-        // Izračunaj nove sredine (mean)
+        // Ako je ostala 1 tačka (neparan broj), dodaj je ručno u globalne sume
+        if (points.size() % 2 != 0) {
+             size_t last_idx = points.size() - 1;
+             int cid = assignments[last_idx];
+             global_sums[cid].x += points[last_idx].x;
+             global_sums[cid].y += points[last_idx].y;
+             global_counts[cid]++;
+        }
+
         calculate_new_mean(global_sums, global_counts);
     }
-    // -------------------------------------------------------------
-
+    
     void initialize_centroids(const std::vector<Point> &points)
     {
         clusters.clear();
