@@ -38,46 +38,77 @@ struct Cluster
 
 class KMeans
 {
+protected:
+    int num_clusters;
+    int max_iterations;
+    std::vector<Cluster> clusters;
+
 public:
     KMeans(int k, int max_iterations = 100)
         : num_clusters(k), max_iterations(max_iterations) {}
 
-    std::vector<Cluster> run_with_parallelization(const std::vector<Point> &points)
+    virtual ~KMeans() = default; 
+    virtual std::vector<Cluster> run(const std::vector<Point> &points) = 0;
+    virtual void update_centroids(const std::vector<Point> &points, const std::vector<int> &assignments) = 0;
+    
+    void initialize_centroids(const std::vector<Point> &points)
     {
-        if (points.size() < num_clusters) return {};
-
-        initialize_centroids(points);
-        std::vector<int> point_assignments(points.size(), -1);
-
-        for (int iter = 0; iter < max_iterations; ++iter)
-        {
-            bool assignments_changed = false;
-
-            // 1. Assignment Step (Parallel)
-            #pragma omp parallel for reduction(|:assignments_changed)
-            for (size_t i = 0; i < points.size(); ++i)
-            {
-                int nearest_cluster_id = get_nearest_cluster_id(points[i]);
-                if (point_assignments[i] != nearest_cluster_id)
-                {
-                    point_assignments[i] = nearest_cluster_id;
-                    assignments_changed = true;
-                }
-            }
-
-            // 2. Update Step (AVX OPTIMIZOVANO)
-            // Ovo je dio koji je asistent tražio (linija ~280 u originalu)
-            update_centroids_avx(points, point_assignments);
-
-            if (!assignments_changed) break;
-        }
-
-        populate_final_clusters(points, point_assignments);
-        return clusters;
+        clusters.clear();
+        std::vector<Point> shuffled_points = points;
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(shuffled_points.begin(), shuffled_points.end(), g);
+        for (int i = 0; i < num_clusters; ++i)
+            clusters.emplace_back(i, shuffled_points[i]);
     }
 
-    // Originalni run metod (zadržan radi kompatibilnosti)
-    std::vector<Cluster> run(const std::vector<Point> &points)
+    double calculate_squared_distance(const Point &p1, const Point &p2)
+    {
+        double dx = p1.x - p2.x;
+        double dy = p1.y - p2.y;
+        return dx * dx + dy * dy;
+    }
+
+    int get_nearest_cluster_id(const Point &point)
+    {
+        double min_dist_sq = std::numeric_limits<double>::max();
+        int nearest_cluster_id = -1;
+        for (const auto &cluster : clusters)
+        {
+            double dist_sq = calculate_squared_distance(point, cluster.centroid);
+            if (dist_sq < min_dist_sq)
+            {
+                min_dist_sq = dist_sq;
+                nearest_cluster_id = cluster.id;
+            }
+        }
+        return nearest_cluster_id;
+    }
+
+    void calculate_new_mean(std::vector<Point> new_centroids, std::vector<int> points_in_cluster){
+        for (int i = 0; i < num_clusters; ++i)
+        {
+            if (points_in_cluster[i] > 0)
+            {
+                clusters[i].centroid.x = new_centroids[i].x / points_in_cluster[i];
+                clusters[i].centroid.y = new_centroids[i].y / points_in_cluster[i];
+            }
+        }
+    }
+
+    void populate_final_clusters(const std::vector<Point> &points, const std::vector<int> &assignments)
+    {
+        for (auto &cluster : clusters) cluster.clear_points();
+        for (size_t i = 0; i < points.size(); ++i)
+            clusters[assignments[i]].add_point(points[i]);
+    }
+};
+
+class KMeansSequential : public KMeans {
+public:
+    using KMeans::KMeans;
+
+    std::vector<Cluster> run(const std::vector<Point> &points) override
     {
         if (points.size() < num_clusters) return {};
         initialize_centroids(points);
@@ -102,13 +133,148 @@ public:
         return clusters;
     }
 
-private:
-    int num_clusters;
-    int max_iterations;
-    std::vector<Cluster> clusters;
+    void update_centroids(const std::vector<Point> &points, const std::vector<int> &assignments) override
+    {
+        std::vector<Point> new_centroids(num_clusters, {0.0, 0.0});
+        std::vector<int> points_in_cluster(num_clusters, 0);
+        for (size_t i = 0; i < points.size(); ++i)
+        {
+            int cluster_id = assignments[i];
+            new_centroids[cluster_id].x += points[i].x;
+            new_centroids[cluster_id].y += points[i].y;
+            points_in_cluster[cluster_id]++;
+        }
+        calculate_new_mean(new_centroids, points_in_cluster);
+    }
+};
 
-    // --- OVO JE KLJUČNA FUNKCIJA KOJU JE ASISTENT TRAŽIO ---
-    void update_centroids_avx(const std::vector<Point> &points, const std::vector<int> &assignments)
+class KMeansOpenMP : public KMeans {
+public:
+    using KMeans::KMeans;
+
+    std::vector<Cluster> run(const std::vector<Point> &points) override {
+        // Cannot have more clusters than points.
+        if (points.size() < num_clusters)
+        {
+            // In a real-world scenario, you might throw an exception.
+            // For this example, we return an empty result.
+            return {};
+        }
+
+        // 1. Initialization: Randomly select K points as initial centroids.
+        initialize_centroids(points);
+
+        // This vector will store the cluster ID for each point.
+        std::vector<int> point_assignments(points.size(), -1);
+
+        // Main K-Means loop
+        for (int iter = 0; iter < max_iterations; ++iter)
+        {
+            bool assignments_changed = false;
+
+// 2. Assignment Step: Assign each point to the nearest centroid.
+#pragma omp parallel for
+            for (size_t i = 0; i < points.size(); ++i)
+            {
+                int nearest_cluster_id = get_nearest_cluster_id(points[i]);
+
+                // If the point's cluster assignment has changed, note it.
+                if (point_assignments[i] != nearest_cluster_id)
+                {
+                    point_assignments[i] = nearest_cluster_id;
+#pragma omp atomic write
+                    assignments_changed = true;
+                }
+            }
+
+            // 3. Update Step: Recalculate centroids based on new assignments.
+            update_centroids(points, point_assignments);
+
+            // 4. Convergence Check: If no assignments changed, the algorithm has converged.
+            if (!assignments_changed)
+            {
+                break;
+            }
+        }
+
+        // Final population of cluster points for the return value
+        populate_final_clusters(points, point_assignments);
+        return clusters;        
+    }
+
+
+    void update_centroids(const std::vector<Point> &points, const std::vector<int> &assignments) override
+    {
+        // Create vectors to accumulate sums and count points for each cluster
+        std::vector<Point> new_centroids(num_clusters, {0.0, 0.0});
+        std::vector<int> points_in_cluster(num_clusters, 0);
+
+#pragma omp parallel
+        {
+            std::vector<Point> new_centroids_local(num_clusters, {0.0, 0.0});
+            std::vector<int> points_in_cluster_local(num_clusters, 0);
+
+#pragma omp for
+            for (size_t i = 0; i < points.size(); ++i)
+            {
+                int cluster_id = assignments[i];
+                new_centroids_local[cluster_id].x += points[i].x;
+                new_centroids_local[cluster_id].y += points[i].y;
+                points_in_cluster_local[cluster_id]++;
+            }
+#pragma omp critical
+            {
+                for (int i = 0; i < num_clusters; i++)
+                {
+                    new_centroids[i].x += new_centroids_local[i].x;
+                    new_centroids[i].y += new_centroids_local[i].y;
+                    points_in_cluster[i] += points_in_cluster_local[i];
+                }
+            }
+        }
+
+        calculate_new_mean(new_centroids, points_in_cluster);
+    }
+};
+
+class KMeansAVX : public KMeans {
+public:
+    using KMeans::KMeans;
+
+    std::vector<Cluster> run(const std::vector<Point> &points) override {
+        if (points.size() < num_clusters) return {};
+
+        initialize_centroids(points);
+        std::vector<int> point_assignments(points.size(), -1);
+
+        for (int iter = 0; iter < max_iterations; ++iter)
+        {
+            bool assignments_changed = false;
+
+            // 1. Assignment Step (Parallel)
+            #pragma omp parallel for reduction(|:assignments_changed)
+            for (size_t i = 0; i < points.size(); ++i)
+            {
+                int nearest_cluster_id = get_nearest_cluster_id(points[i]);
+                if (point_assignments[i] != nearest_cluster_id)
+                {
+                    point_assignments[i] = nearest_cluster_id;
+                    assignments_changed = true;
+                }
+            }
+
+            // 2. Update Step (AVX OPTIMIZOVANO)
+            // Ovo je dio koji je asistent tražio (linija ~280 u originalu)
+            update_centroids(points, point_assignments);
+
+            if (!assignments_changed) break;
+        }
+
+        populate_final_clusters(points, point_assignments);
+        return clusters;
+    }
+
+    void update_centroids(const std::vector<Point> &points, const std::vector<int> &assignments) override
     {
         int num_avx_clusters = (num_clusters + 1) / 2;
 
@@ -219,74 +385,8 @@ private:
 
         calculate_new_mean(global_sums, global_counts);
     }
-    
-    void initialize_centroids(const std::vector<Point> &points)
-    {
-        clusters.clear();
-        std::vector<Point> shuffled_points = points;
-        std::random_device rd;
-        std::mt19937 g(rd());
-        std::shuffle(shuffled_points.begin(), shuffled_points.end(), g);
-        for (int i = 0; i < num_clusters; ++i)
-            clusters.emplace_back(i, shuffled_points[i]);
-    }
-
-    double calculate_squared_distance(const Point &p1, const Point &p2)
-    {
-        double dx = p1.x - p2.x;
-        double dy = p1.y - p2.y;
-        return dx * dx + dy * dy;
-    }
-
-    int get_nearest_cluster_id(const Point &point)
-    {
-        double min_dist_sq = std::numeric_limits<double>::max();
-        int nearest_cluster_id = -1;
-        for (const auto &cluster : clusters)
-        {
-            double dist_sq = calculate_squared_distance(point, cluster.centroid);
-            if (dist_sq < min_dist_sq)
-            {
-                min_dist_sq = dist_sq;
-                nearest_cluster_id = cluster.id;
-            }
-        }
-        return nearest_cluster_id;
-    }
-
-    // Stari update metod (zadržan ako treba)
-    void update_centroids(const std::vector<Point> &points, const std::vector<int> &assignments)
-    {
-        std::vector<Point> new_centroids(num_clusters, {0.0, 0.0});
-        std::vector<int> points_in_cluster(num_clusters, 0);
-        for (size_t i = 0; i < points.size(); ++i)
-        {
-            int cluster_id = assignments[i];
-            new_centroids[cluster_id].x += points[i].x;
-            new_centroids[cluster_id].y += points[i].y;
-            points_in_cluster[cluster_id]++;
-        }
-        calculate_new_mean(new_centroids, points_in_cluster);
-    }
-
-    void calculate_new_mean(std::vector<Point> new_centroids, std::vector<int> points_in_cluster){
-        for (int i = 0; i < num_clusters; ++i)
-        {
-            if (points_in_cluster[i] > 0)
-            {
-                clusters[i].centroid.x = new_centroids[i].x / points_in_cluster[i];
-                clusters[i].centroid.y = new_centroids[i].y / points_in_cluster[i];
-            }
-        }
-    }
-
-    void populate_final_clusters(const std::vector<Point> &points, const std::vector<int> &assignments)
-    {
-        for (auto &cluster : clusters) cluster.clear_points();
-        for (size_t i = 0; i < points.size(); ++i)
-            clusters[assignments[i]].add_point(points[i]);
-    }
 };
+
 
 void save_clusters_to_csv(const std::vector<Cluster> &clusters, const std::string &filename)
 {
@@ -304,8 +404,8 @@ void save_clusters_to_csv(const std::vector<Cluster> &clusters, const std::strin
 
 int main()
 {
-    const int num_points = 100000; // Povećao sam malo broj tačaka da se vidi razlika
-    const int num_clusters = 7;
+    const int num_points = 1000000;
+    const int num_clusters = 10;
 
     std::vector<Point> points;
     points.reserve(num_points);
@@ -316,22 +416,42 @@ int main()
     for (int i = 0; i < num_points; ++i)
         points.push_back({dist(gen), dist(gen)});
 
-    KMeans kmeans(num_clusters);
+    KMeans* kmeans_sequential = new KMeansSequential(num_clusters);
+    KMeans* kmeans_openmp = new KMeansOpenMP(num_clusters);
+    KMeans* kmeans_AVX = new KMeansAVX(num_clusters);
 
     // Mjerenje standardne verzije
     auto start = std::chrono::high_resolution_clock::now();
-    kmeans.run(points); // Pokreće standardnu verziju (bez AVX update-a, samo serijski ili stari parallel)
+    kmeans_sequential->run(points); 
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
 
+    //Mjerenje OPenMp verzije
+    auto start_par_omp = std::chrono::high_resolution_clock::now();
+    kmeans_openmp->run(points); 
+    auto end_par_omp = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration_par_omp = end_par_omp - start_par_omp;
+
     // Mjerenje AVX verzije
-    auto start_par = std::chrono::high_resolution_clock::now();
-    auto clusters = kmeans.run_with_parallelization(points); // Pokreće AVX verziju
-    auto end_par = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration_par = end_par - start_par;
+    auto start_par_avx = std::chrono::high_resolution_clock::now();
+    auto clusters = kmeans_AVX->run(points); 
+    auto end_par_avx = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration_par_avx = end_par_avx - start_par_avx;
 
     std::cout << "Standard K-Means finished in " << duration.count() << " seconds.\n";
-    std::cout << "AVX Optimized K-Means finished in " << duration_par.count() << " seconds.\n";
+    std::cout << "OpenMP Optimized K-Means finished in " << duration_par_omp.count() << " seconds.\n";
+    std::cout << "AVX Optimized K-Means finished in " << duration_par_avx.count() << " seconds.\n";
+
+    // Output results
+    std::cout << "Final cluster centroids:\n";
+
+    for (const auto &cluster : clusters)
+    {
+        std::cout << "Cluster " << cluster.id << ": ("
+                  << cluster.centroid.x << ", "
+                  << cluster.centroid.y << ")"
+                  << " -> " << cluster.points.size() << " points\n";
+    }
 
     save_clusters_to_csv(clusters, "clusters.csv");
     return 0;
